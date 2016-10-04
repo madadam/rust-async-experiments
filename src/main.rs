@@ -121,10 +121,15 @@ impl EventLoop {
     }
 
     fn poll_all(futures: &mut Vec<Box<LeafFuture>>) {
-        // TODO: remove completed futures.
-        for future in futures.iter_mut() {
-            let _ = future.poll();
-        }
+        // Poll all futures and remove those that already completed.
+        let polled_futures = futures.drain(..).filter_map(|mut future| {
+            match future.poll() {
+                Ok(Async::Ready(_)) | Err(_) => None,
+                Ok(Async::NotReady) => Some(future),
+            }
+        }).collect();
+
+        *futures = polled_futures;
     }
 }
 
