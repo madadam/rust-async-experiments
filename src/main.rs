@@ -5,6 +5,7 @@ extern crate rand;
 extern crate unwrap;
 
 use futures::{Async, Future, Poll};
+use futures::task::{self, Spawn, Task, Unpark};
 use maidsafe_utilities::thread::Joiner;
 use self::routing::Client as RoutingClient;
 use self::routing::Event as RoutingEvent;
@@ -12,6 +13,8 @@ use self::routing::{Data, Error, MessageId};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::thread;
 use std::time::Duration;
@@ -101,19 +104,17 @@ impl EventLoop {
 
         let main_joiner = Joiner::new(thread::spawn(move || {
             let client = Rc::new(RefCell::new(Client::new(routing)));
-            let mut pending_futures = Vec::new();
+            let mut driver = Driver::new();
 
             for event in event_rx {
                 match event {
                     Event::User(mut action) => {
-                        let mut future = action.call(client.clone());
-                        if let Ok(Async::NotReady) = future.poll() {
-                            pending_futures.push(future);
-                        }
+                        let future = action.call(client.clone());
+                        driver.drive(future);
                     },
                     Event::Routing(event) => {
                         client.borrow_mut().handle_routing_event(event);
-                        Self::poll_all(&mut pending_futures);
+                        driver.notify();
                     },
                     Event::Terminate => break,
                 }
@@ -139,18 +140,6 @@ impl EventLoop {
             Box::new(f(client).map(|_| ()).map_err(|_| ()))
         };
         let _ = self.event_tx.send(Event::User(UserAction::new(f)));
-    }
-
-    fn poll_all(futures: &mut Vec<Box<LeafFuture>>) {
-        // Poll all futures and remove those that already completed.
-        let polled_futures = futures.drain(..).filter_map(|mut future| {
-            match future.poll() {
-                Ok(Async::Ready(_)) | Err(_) => None,
-                Ok(Async::NotReady) => Some(future),
-            }
-        }).collect();
-
-        *futures = polled_futures;
     }
 }
 
@@ -187,7 +176,7 @@ enum Event {
 
 struct Client {
     routing: RoutingClient,
-    pending_requests: HashMap<MessageId, ResponseHolder>,
+    pending_requests: HashMap<MessageId, Rc<RefCell<ResponseData>>>,
 }
 
 impl Client {
@@ -198,43 +187,121 @@ impl Client {
         }
     }
 
-    fn get(&mut self, will_succeed: bool) -> Box<Future<Item=Data, Error=Error>> {
-        let holder = Rc::new(RefCell::new(None));
+    fn get(&mut self, will_succeed: bool) -> Response {
+        let response_data = Rc::new(RefCell::new(ResponseData::new()));
         let message_id = MessageId::new();
 
-        let _ = self.pending_requests.insert(message_id, holder.clone());
+        let _ = self.pending_requests.insert(message_id, response_data.clone());
         self.routing.send_get_request(message_id, will_succeed);
 
-        Box::new(Response(holder))
+        Response(response_data)
     }
 
     fn handle_routing_event(&mut self, event: RoutingEvent) {
-        let (key, result) = match event {
+        let (id, result) = match event {
             RoutingEvent::GetSuccess(id, data) => (id, Ok(data)),
             RoutingEvent::GetFailure(id, error) => (id, Err(error)),
         };
 
-        if let Some(holder) = self.pending_requests.remove(&key) {
-            *holder.borrow_mut() = Some(result);
+        let task = if let Some(data) = self.pending_requests.remove(&id) {
+            let mut data = data.borrow_mut();
+            data.result = Some(result);
+            data.task.take()
+        } else {
+            None
+        };
+
+        if let Some(task) = task {
+            task.unpark()
         }
     }
 }
 
-type ResponseHolder = Rc<RefCell<Option<Result<Data, Error>>>>;
+struct Response(Rc<RefCell<ResponseData>>);
 
-// Pending response from routing.
-struct Response(ResponseHolder);
+struct ResponseData {
+    result: Option<Result<Data, Error>>,
+    task: Option<Task>,
+}
+
+impl ResponseData {
+    fn new() -> Self {
+        ResponseData {
+            result: None,
+            task: None,
+        }
+    }
+}
 
 impl Future for Response {
     type Item = Data;
     type Error = Error;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        match self.0.borrow_mut().take() {
+        let mut data = self.0.borrow_mut();
+        match data.result.take() {
             Some(Ok(data)) => Ok(Async::Ready(data)),
             Some(Err(error)) => Err(error),
-            None => Ok(Async::NotReady),
+            None => {
+                data.task = Some(task::park());
+                Ok(Async::NotReady)
+            }
         }
+    }
+}
+
+// Helper type to drive futures to completion.
+struct Driver {
+    next_id: usize,
+    spawns: HashMap<usize, Spawn<Box<LeafFuture>>>,
+    completed_id: Arc<AtomicUsize>,
+}
+
+impl Driver {
+    pub fn new() -> Self {
+        Driver {
+            next_id: 1,
+            spawns: HashMap::new(),
+            completed_id: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    // Attempt to drive the future to completion. This either happens now, or
+    // at some later time during the call to `notify`.
+    pub fn drive(&mut self, future: Box<LeafFuture>) {
+        let id = self.next_id();
+        self.poll(id, task::spawn(future));
+    }
+
+    // Notify the driver that some futures became completed.
+    pub fn notify(&mut self) {
+        let id = self.completed_id.swap(0, Ordering::Relaxed);
+        if id == 0 { return; }
+
+        if let Some(spawn) = self.spawns.remove(&id) {
+            self.poll(id, spawn);
+        }
+    }
+
+    fn next_id(&mut self) -> usize {
+        let result = self.next_id;
+        self.next_id += 1;
+        result
+    }
+
+    fn poll(&mut self, id: usize, mut spawn: Spawn<Box<LeafFuture>>) {
+        let guard = Notifier(id, self.completed_id.clone());
+        if let Ok(Async::NotReady) = spawn.poll_future(Arc::new(guard)) {
+            let _ = self.spawns.insert(id, spawn);
+        }
+    }
+}
+
+struct Notifier(usize, Arc<AtomicUsize>);
+
+impl Unpark for Notifier {
+    fn unpark(&self) {
+        self.1.store(self.0, Ordering::Relaxed)
     }
 }
 
