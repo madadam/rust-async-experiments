@@ -17,40 +17,59 @@ use std::thread;
 use std::time::Duration;
 
 fn main() {
-    let el = EventLoop::new();
+    let session = Session::new();
 
-    el.post(|client| {
-        client.borrow_mut().get(true).map(|_| {
-            println!("get 0 success");
-        }).map_err(|_| {
-            println!("get 0 failure");
+    fn callback(result_code: i32) {
+        if result_code == 0 {
+            println!("success");
+        } else {
+            println!("failure: {}", result_code);
+        }
+    }
+
+    example_ffi_function1(&session, callback);
+    example_ffi_function1(&session, callback);
+    example_ffi_function2(&session, callback);
+
+    thread::sleep(Duration::from_millis(1000));
+}
+
+fn example_ffi_function1(session: &Session, cb: fn(i32)) {
+    session.event_loop.post(move |client| {
+        client.borrow_mut().get(true).map(move |_| {
+            cb(0);
+        }).map_err(move |_| {
+            cb(-1);
         })
     });
+}
 
-    el.post(|client| {
-        client.borrow_mut().get(false).map(|_| {
-            println!("get 1 success");
-        }).map_err(|_| {
-            println!("get 1 failure");
-        })
-    });
-
-    el.post(|client| {
+fn example_ffi_function2(session: &Session, cb: fn(i32)) {
+    session.event_loop.post(move |client| {
         let client2 = client.clone();
 
         let mut client = client.borrow_mut();
         client.get(true).and_then(move |_| {
-            println!("get 2 success");
             let mut client = client2.borrow_mut();
             client.get(false)
-        }).map(|_| {
-            println!("get 3 success");
-        }).map_err(|_| {
-            println!("get 2 or 3 failure");
+        }).map(move |_| {
+            cb(0);
+        }).map_err(move |_| {
+            cb(-1);
         })
     });
+}
 
-    thread::sleep(Duration::from_millis(1000));
+struct Session {
+    event_loop: EventLoop,
+}
+
+impl Session {
+    pub fn new() -> Self {
+        Session {
+            event_loop: EventLoop::new(),
+        }
+    }
 }
 
 type LeafFuture = Future<Item=(), Error=()>;
@@ -114,6 +133,8 @@ impl EventLoop {
         where F: FnOnce(Rc<RefCell<Client>>) -> R + Send + 'static,
               R: Future + 'static
     {
+        // Convert the future returned from the closure to
+        // Box<Future<Item=(), Error=()>>
         let f = move |client| -> Box<LeafFuture> {
             Box::new(f(client).map(|_| ()).map_err(|_| ()))
         };
